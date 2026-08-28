@@ -103,7 +103,9 @@ type GCECompute interface {
 	InsertDisk(ctx context.Context, project string, volKey *meta.Key, params common.DiskParameters, capBytes int64, capacityRange *csi.CapacityRange, replicaZones []string, snapshotID string, volumeContentSourceVolumeID string, multiWriter bool, accessMode string) error
 	DeleteDisk(ctx context.Context, project string, volumeKey *meta.Key) error
 	UpdateDisk(ctx context.Context, project string, volKey *meta.Key, existingDisk *CloudDisk, params common.ModifyVolumeParameters) error
-	AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string, forceAttach bool) error
+	AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string, forceAttach bool, reqID string) error
+	GetOperationByClientOpID(ctx context.Context, project, instanceZone, clientOpID string) (*computev1.Operation, error)
+	WaitForZonalOp(ctx context.Context, project, opName string, zone string) error
 	DetachDisk(ctx context.Context, project, deviceName, instanceZone, instanceName string) error
 	SetDiskAccessMode(ctx context.Context, project string, volKey *meta.Key, accessMode string) error
 	ListCompatibleDiskTypeZones(ctx context.Context, project string, zones []string, diskType string) ([]string, error)
@@ -894,8 +896,8 @@ func (cloud *CloudProvider) deleteRegionalDisk(ctx context.Context, project, reg
 	return nil
 }
 
-func (cloud *CloudProvider) AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string, forceAttach bool) error {
-	klog.V(5).Infof("Attaching disk %v to %s", volKey, instanceName)
+func (cloud *CloudProvider) AttachDisk(ctx context.Context, project string, volKey *meta.Key, readWrite, diskType, instanceZone, instanceName string, forceAttach bool, reqID string) error {
+	klog.V(5).Infof("Attaching disk %v to %s (requestId: %s)", volKey, instanceName, reqID)
 	source := cloud.GetDiskSourceURI(project, volKey)
 
 	deviceName, err := common.GetDeviceName(volKey)
@@ -918,13 +920,17 @@ func (cloud *CloudProvider) AttachDisk(ctx context.Context, project string, volK
 	if _, ok := cloud.tenantServiceMap[project]; ok {
 		service = cloud.tenantServiceMap[project]
 	}
-	op, err := service.Instances.AttachDisk(project, instanceZone, instanceName, attachedDiskV1).Context(ctx).ForceAttach(forceAttach).Do()
+	attachCall := service.Instances.AttachDisk(project, instanceZone, instanceName, attachedDiskV1).Context(ctx).ForceAttach(forceAttach)
+	if reqID != "" {
+		attachCall = attachCall.RequestId(reqID)
+	}
+	op, err := attachCall.Do()
 	if err != nil {
 		return fmt.Errorf("failed cloud service attach disk call: %w", err)
 	}
-	klog.V(5).Infof("AttachDisk operation %s for disk %s", op.Name, attachedDiskV1.DeviceName)
+	klog.V(5).Infof("AttachDisk operation %s (requestId: %s) for disk %s", op.Name, reqID, attachedDiskV1.DeviceName)
 
-	err = cloud.waitForZonalOp(ctx, project, op.Name, instanceZone)
+	err = cloud.WaitForZonalOp(ctx, project, op.Name, instanceZone)
 	if err != nil {
 		return fmt.Errorf("failed when waiting for zonal op: %w", err)
 	}
@@ -1063,10 +1069,35 @@ func (cloud *CloudProvider) getRegionalDiskTypeURI(project string, region, diskT
 	return cloud.service.BasePath + fmt.Sprintf(diskTypeURITemplateRegional, project, region, diskType)
 }
 
-func (cloud *CloudProvider) waitForZonalOp(ctx context.Context, project, opName string, zone string) error {
+func (cloud *CloudProvider) GetOperationByClientOpID(ctx context.Context, project, instanceZone, clientOpID string) (*computev1.Operation, error) {
+	if clientOpID == "" {
+		return nil, nil
+	}
+	service := cloud.service
+	if _, ok := cloud.tenantServiceMap[project]; ok {
+		service = cloud.tenantServiceMap[project]
+	}
+	filter := fmt.Sprintf("clientOperationId = %s", clientOpID)
+	opList, err := service.ZoneOperations.List(project, instanceZone).Filter(filter).Context(ctx).Do()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list zonal operations for clientOperationId %s: %w", clientOpID, err)
+	}
+	for _, op := range opList.Items {
+		if op.ClientOperationId == clientOpID {
+			return op, nil
+		}
+	}
+	return nil, nil
+}
+
+func (cloud *CloudProvider) WaitForZonalOp(ctx context.Context, project, opName string, zone string) error {
 	// The v1 API can query for v1, alpha, or beta operations.
 	return wait.ExponentialBackoff(WaitForOpBackoff, func() (bool, error) {
-		pollOp, err := cloud.service.ZoneOperations.Get(project, zone, opName).Context(ctx).Do()
+		service := cloud.service
+		if _, ok := cloud.tenantServiceMap[project]; ok {
+			service = cloud.tenantServiceMap[project]
+		}
+		pollOp, err := service.ZoneOperations.Get(project, zone, opName).Context(ctx).Do()
 		if err != nil {
 			klog.Errorf("WaitForOp(op: %s, zone: %#v) failed to poll the operation", opName, zone)
 			return false, err
@@ -1074,6 +1105,10 @@ func (cloud *CloudProvider) waitForZonalOp(ctx context.Context, project, opName 
 		done, err := opIsDone(pollOp)
 		return done, err
 	})
+}
+
+func (cloud *CloudProvider) waitForZonalOp(ctx context.Context, project, opName string, zone string) error {
+	return cloud.WaitForZonalOp(ctx, project, opName, zone)
 }
 
 func (cloud *CloudProvider) waitForRegionalOp(ctx context.Context, project, opName string, region string) error {

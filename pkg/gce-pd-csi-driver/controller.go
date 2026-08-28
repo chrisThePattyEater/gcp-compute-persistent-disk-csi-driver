@@ -31,6 +31,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	googleuuid "github.com/google/uuid"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/client-go/util/flowcontrol"
@@ -1202,7 +1203,8 @@ func (gceCS *GCEControllerServer) executeControllerPublishVolume(ctx context.Con
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "could not split nodeID: %v", err.Error()), disk
 	}
-	err = gceCS.CloudProvider.AttachDisk(ctx, project, volKey, readWrite, attachableDiskTypePersistent, instanceZone, instanceName, pdcsiContext.ForceAttach)
+	reqID := generateAttachCycleUUID(volumeID, nodeID, disk)
+	err = gceCS.CloudProvider.AttachDisk(ctx, project, volKey, readWrite, attachableDiskTypePersistent, instanceZone, instanceName, pdcsiContext.ForceAttach, reqID)
 	if err != nil {
 		var udErr *gce.UnsupportedDiskError
 		if errors.As(err, &udErr) {
@@ -1318,12 +1320,19 @@ func (gceCS *GCEControllerServer) executeControllerUnpublishVolume(ctx context.C
 	}
 
 	attached := diskIsAttached(deviceName, instance)
+	if !attached {
+		attached, err = gceCS.waitForInflightAttach(ctx, project, volumeID, nodeID, instanceZone, instanceName, deviceName, diskToUnpublish)
+		if err != nil {
+			return nil, err, diskToUnpublish
+		}
+	}
 
 	if !attached {
 		// Volume is not attached to node. Success!
 		klog.V(4).Infof("ControllerUnpublishVolume succeeded for disk %v from node %v. Already not attached.", volKey, nodeID)
 		return &csi.ControllerUnpublishVolumeResponse{}, nil, diskToUnpublish
 	}
+
 	err = gceCS.CloudProvider.DetachDisk(ctx, project, deviceName, instanceZone, instanceName)
 	if err != nil {
 		return nil, common.LoggedError("Failed to detach: ", err), diskToUnpublish
@@ -1331,6 +1340,42 @@ func (gceCS *GCEControllerServer) executeControllerUnpublishVolume(ctx context.C
 
 	klog.V(4).Infof("ControllerUnpublishVolume succeeded for disk %v from node %v", volKey, nodeID)
 	return &csi.ControllerUnpublishVolumeResponse{}, nil, diskToUnpublish
+}
+
+func (gceCS *GCEControllerServer) waitForInflightAttach(ctx context.Context, project, volumeID, nodeID, instanceZone, instanceName, deviceName string, disk *gce.CloudDisk) (bool, error) {
+	if disk == nil {
+		klog.Warningf("Could not check in-flight attach operation for volume %v on node %v because disk could not be retrieved", volumeID, nodeID)
+		return false, nil
+	}
+
+	reqID := generateAttachCycleUUID(volumeID, nodeID, disk)
+	op, err := gceCS.CloudProvider.GetOperationByClientOpID(ctx, project, instanceZone, reqID)
+	if err != nil {
+		return false, fmt.Errorf("failed to check attach operations: %w", err)
+	}
+	if op == nil {
+		return false, nil
+	}
+
+	if op.Status != "DONE" {
+		klog.Infof("Waiting for in-flight attach operation %s (requestId: %s) for volume %s on node %s", op.Name, reqID, volumeID, instanceName)
+		err = gceCS.CloudProvider.WaitForZonalOp(ctx, project, op.Name, instanceZone)
+		if err != nil {
+			return false, fmt.Errorf("failed when waiting for in-flight attach operation %s: %w", op.Name, err)
+		}
+	}
+
+	// Refresh instance to verify if disk attached
+	instance, err := gceCS.CloudProvider.GetInstanceOrError(ctx, project, instanceZone, instanceName)
+	if err != nil {
+		if gce.IsGCENotFoundError(err) {
+			klog.Warningf("Treating volume %v as unpublished because node %v could not be found", volumeID, instanceName)
+			return false, nil
+		}
+		return false, common.LoggedError("error getting instance after checking attach operation: ", err)
+	}
+
+	return diskIsAttached(deviceName, instance), nil
 }
 
 func (gceCS *GCEControllerServer) parameterProcessor() *common.ParameterProcessor {
@@ -2170,6 +2215,18 @@ func getRequestCapacity(capRange *csi.CapacityRange) (int64, error) {
 		capBytes = MinimumVolumeSizeInBytes
 	}
 	return capBytes, nil
+}
+
+func generateAttachCycleUUID(volumeID, nodeID string, disk *gce.CloudDisk) string {
+	incarnation := ""
+	if disk != nil {
+		incarnation = disk.GetLastDetachTimestamp()
+		if incarnation == "" {
+			incarnation = disk.GetCreationTimestamp()
+		}
+	}
+	seed := fmt.Sprintf("%s/%s/%s", volumeID, nodeID, incarnation)
+	return googleuuid.NewSHA1(googleuuid.NameSpaceURL, []byte(seed)).String()
 }
 
 func diskIsAttached(deviceName string, instance *compute.Instance) bool {
