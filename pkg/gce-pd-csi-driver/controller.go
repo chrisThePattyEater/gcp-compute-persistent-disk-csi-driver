@@ -1204,6 +1204,8 @@ func (gceCS *GCEControllerServer) executeControllerPublishVolume(ctx context.Con
 		return nil, status.Errorf(codes.InvalidArgument, "could not split nodeID: %v", err.Error()), disk
 	}
 	reqID := generateAttachCycleUUID(volumeID, nodeID, disk)
+	klog.Infof("[POC VERIFICATION] ControllerPublishVolume: Generated attach cycle UUID %s for volume %s on node %s (LastDetachTimestamp: %q, CreationTimestamp: %q)",
+		reqID, volumeID, nodeID, disk.GetLastDetachTimestamp(), disk.GetCreationTimestamp())
 	err = gceCS.CloudProvider.AttachDisk(ctx, project, volKey, readWrite, attachableDiskTypePersistent, instanceZone, instanceName, pdcsiContext.ForceAttach, reqID)
 	if err != nil {
 		var udErr *gce.UnsupportedDiskError
@@ -1317,6 +1319,21 @@ func (gceCS *GCEControllerServer) executeControllerUnpublishVolume(ctx context.C
 	deviceName, err := common.GetDeviceName(volKey)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "error getting device name: %v", err.Error()), diskToUnpublish
+	}
+
+	// [POC VERIFICATION] Always retrieve and log the GCE Operation for this attach cycle to verify requestId matching in production/staging.
+	if diskToUnpublish != nil {
+		pocReqID := generateAttachCycleUUID(volumeID, nodeID, diskToUnpublish)
+		pocOp, pocErr := gceCS.CloudProvider.GetOperationByClientOpID(ctx, project, instanceZone, pocReqID)
+		if pocErr != nil {
+			klog.Infof("[POC VERIFICATION] ControllerUnpublishVolume: Error querying GCE Operation for requestId %s: %v", pocReqID, pocErr)
+		} else if pocOp != nil {
+			klog.Infof("[POC VERIFICATION] ControllerUnpublishVolume: MATCHED GCE Operation for requestId %s: name=%s, status=%s, opType=%s, targetLink=%s, insertTime=%s, endTime=%s",
+				pocReqID, pocOp.Name, pocOp.Status, pocOp.OperationType, pocOp.TargetLink, pocOp.InsertTime, pocOp.EndTime)
+		} else {
+			klog.Infof("[POC VERIFICATION] ControllerUnpublishVolume: No GCE Operation found for requestId %s (volume: %s, node: %s, LastDetachTimestamp: %q, CreationTimestamp: %q)",
+				pocReqID, volumeID, nodeID, diskToUnpublish.GetLastDetachTimestamp(), diskToUnpublish.GetCreationTimestamp())
+		}
 	}
 
 	attached := diskIsAttached(deviceName, instance)
